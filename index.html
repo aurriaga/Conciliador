@@ -192,6 +192,10 @@ details.avanzado>summary::-webkit-details-marker{display:none}
 details.avanzado>summary::after{content:"▾";margin-left:auto;color:var(--muted)}
 details.avanzado[open]>summary::after{content:"▴"}
 
+details.regla{margin-top:12px;background:var(--surface-2)}
+details.regla summary{font-size:12.5px;color:var(--accent);font-weight:600}
+details.regla .map-grid{padding:8px 12px 12px}
+
 /* ---------- tablas ---------- */
 .tbl-wrap{overflow-x:auto;border:1px solid var(--rule);border-radius:8px;background:var(--surface)}
 .tbl-wrap.flat{border:0;border-radius:0}
@@ -1296,7 +1300,7 @@ window.DEMO_DATA={"empresa":"Distribuidora Quillay SpA (ejemplo ficticio)","banc
     const bco = cuentaBanco || 'Banco';
     const A = (lineas, glosa, nota) => ({ lineas, glosa, nota: nota || null });
     const abs = (n) => Math.abs(n);
-    const b = d.banco[0] && byId.get(d.banco[0]); const l = d.libro[0] && byId.get(d.libro[0]);
+    const b = byId && d.banco[0] ? byId.get(d.banco[0]) : null; const l = byId && d.libro[0] ? byId.get(d.libro[0]) : null;
     const contra = (l && l.contra) || 'Contrapartida del asiento original';
     switch (d.tipo) {
       case 'cargo_banco':
@@ -1357,7 +1361,7 @@ window.DEMO_DATA={"empresa":"Distribuidora Quillay SpA (ejemplo ficticio)","banc
   }
 
   root.Concilia = {
-    nombreCuenta, norm, parseAmount, parseDate, parseTable, parseCSV, parsePdf, pdfToLines, detectBank, detectHeader, classifyHeader,
+    nombreCuenta, asientoSugerido, norm, parseAmount, parseDate, parseTable, parseCSV, parsePdf, pdfToLines, detectBank, detectHeader, classifyHeader,
     reconcile, resumenPeriodo, categorize, contraparte, similarity, fmtCLP, fmtFecha, dayNum, fromDayNum, TIPOS, BANCOS, postProcess, looksAmount,
   };
 })(typeof window !== 'undefined' ? window : globalThis);
@@ -1886,6 +1890,142 @@ window.DEMO_DATA={"empresa":"Distribuidora Quillay SpA (ejemplo ficticio)","banc
 
 </script>
 <script>
+/* ============================================================
+   Memoria del conciliador
+   - Reglas aprendidas: glosa reconocible -> cuenta del plan del cliente
+   - Cuenta contable recordada para cada cartola
+   - Todo queda en este equipo; se puede exportar e importar
+   ============================================================ */
+(function (root) {
+  'use strict';
+  const C = root.Concilia;
+  const KEY = 'conciliador-memoria.v1';
+
+  function cargar() { try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch (e) { return {}; } }
+  function guardar(db) { try { localStorage.setItem(KEY, JSON.stringify(db)); return true; } catch (e) { return false; } }
+  function claveEmpresa(rut, empresa) {
+    const r = String(rut || '').replace(/[^0-9kK]/g, '').toUpperCase();
+    if (r.length >= 7) return r;
+    const e = C.norm(empresa || '').replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+    return e || 'sin-empresa';
+  }
+  function espacio(db, clave, empresa) {
+    if (!db[clave]) db[clave] = { empresa: empresa || '', reglas: [], cuentas: {}, creado: new Date().toISOString() };
+    if (empresa && !db[clave].empresa) db[clave].empresa = empresa;
+    if (!db[clave].cuentas) db[clave].cuentas = {};
+    if (!db[clave].reglas) db[clave].reglas = [];
+    return db[clave];
+  }
+
+  // Parte estable de la glosa: sin números de operación ni RUT sueltos
+  function patronDe(desc) {
+    let t = C.norm(desc);
+    t = t.replace(/\b\d{1,2}\.?\d{3}\.?\d{3}-?[0-9k]\b/g, ' ');   // RUT
+    t = t.replace(/\b\d{4,}\b/g, ' ');                              // números de operación
+    t = t.replace(/[^a-z0-9ñ ]+/g, ' ').replace(/\s+/g, ' ').trim();
+    const palabras = t.split(' ').filter((p) => p.length > 1);
+    return palabras.slice(0, 5).join(' ');
+  }
+  const calza = (patron, desc) => !!patron && C.norm(desc).replace(/[^a-z0-9ñ ]+/g, ' ').replace(/\s+/g, ' ').includes(patron);
+
+  function reglaPara(esp, desc, signo) {
+    const cands = (esp.reglas || []).filter((r) => calza(r.patron, desc) && (!r.signo || !signo || r.signo === signo));
+    if (!cands.length) return null;
+    if (cands.length > 1) {
+      const cuentas = new Set(cands.map((r) => r.cuentaCodigo + '|' + r.cuentaNombre));
+      if (cuentas.size > 1) return { conflicto: true, opciones: cands };   // misma glosa con dos tratamientos: preguntar
+    }
+    cands.sort((a, b) => b.patron.length - a.patron.length);
+    return cands[0];
+  }
+
+  function agregarRegla(clave, empresa, datos) {
+    const db = cargar(); const esp = espacio(db, clave, empresa);
+    const patron = (datos.patron || '').trim();
+    if (!patron) return null;
+    const previa = esp.reglas.find((r) => r.patron === patron && r.signo === (datos.signo || 0));
+    const regla = previa || { id: 'R' + Date.now().toString(36) + Math.floor(Math.random() * 1000), patron, signo: datos.signo || 0, creada: new Date().toISOString(), usos: 0 };
+    regla.cuentaCodigo = datos.cuentaCodigo || '';
+    regla.cuentaNombre = datos.cuentaNombre || '';
+    regla.tipo = datos.tipo || '';
+    regla.glosa = datos.glosa || '';
+    regla.editada = new Date().toISOString();
+    if (!previa) esp.reglas.push(regla);
+    guardar(db);
+    return regla;
+  }
+  function borrarRegla(clave, id) {
+    const db = cargar(); const esp = espacio(db, clave);
+    esp.reglas = esp.reglas.filter((r) => r.id !== id);
+    guardar(db);
+  }
+  function listar(clave) { const esp = cargar()[clave]; return esp ? { empresa: esp.empresa, reglas: esp.reglas || [], cuentas: esp.cuentas || {} } : { empresa: '', reglas: [], cuentas: {} }; }
+
+  // Aplica las reglas a las diferencias; devuelve cuántas tocó
+  function aplicar(clave, diffs, cuentaBanco, firma, byId) {
+    const db = cargar(); const esp = db[clave];
+    if (!esp || !esp.reglas || !esp.reglas.length) return { aplicadas: 0, conflictos: 0 };
+    let aplicadas = 0, conflictos = 0; const usadas = new Set();
+    for (const d of diffs) {
+      if (d.tipo !== 'cargo_banco' && d.tipo !== 'abono_banco') continue;
+      const r = reglaPara(esp, d.desc, d.monto < 0 ? -1 : 1);
+      if (!r) continue;
+      if (r.conflicto) { d.reglaConflicto = r.opciones.map((x) => ({ id: x.id, cuenta: C.nombreCuenta({ codigo: x.cuentaCodigo, nombre: x.cuentaNombre }) })); conflictos++; continue; }
+      d.cuentaSugerida = C.nombreCuenta({ codigo: r.cuentaCodigo, nombre: r.cuentaNombre });
+      d.delPlan = true;
+      d.regla = { id: r.id, patron: r.patron, usos: r.usos || 0 };
+      if (r.glosa) d.glosaRegla = r.glosa;
+      d.asiento = C.asientoSugerido(d, byId || null, cuentaBanco);
+      if (r.glosa && d.asiento) d.asiento.glosa = r.glosa;
+      aplicadas++; usadas.add(r.id);
+    }
+    // contar el uso una vez por conciliación (no en cada repintado)
+    if (firma && esp.ultimaFirma !== firma && usadas.size) {
+      esp.ultimaFirma = firma;
+      for (const r of esp.reglas) if (usadas.has(r.id)) { r.usos = (r.usos || 0) + 1; r.ultimoUso = new Date().toISOString(); }
+      guardar(db);
+    }
+    return { aplicadas, conflictos };
+  }
+
+  function recordarCuenta(clave, empresa, numeroCuenta, cuentaKey) {
+    const n = String(numeroCuenta || '').replace(/\D/g, '').replace(/^0+/, '');
+    if (!n || !cuentaKey) return;
+    const db = cargar(); const esp = espacio(db, clave, empresa);
+    esp.cuentas[n] = cuentaKey; guardar(db);
+  }
+  function cuentaRecordada(clave, numeroCuenta) {
+    const n = String(numeroCuenta || '').replace(/\D/g, '').replace(/^0+/, '');
+    const esp = cargar()[clave];
+    return esp && esp.cuentas ? esp.cuentas[n] || null : null;
+  }
+
+  function exportar(clave) {
+    const esp = cargar()[clave] || { reglas: [], cuentas: {} };
+    return JSON.stringify({ formato: 'conciliador-memoria', version: 1, empresa: esp.empresa || '', rut: clave, exportado: new Date().toISOString(), reglas: esp.reglas || [], cuentas: esp.cuentas || {} }, null, 2);
+  }
+  function importar(clave, empresa, texto) {
+    let datos; try { datos = JSON.parse(texto); } catch (e) { return { error: 'El archivo no es una memoria válida.' }; }
+    if (!datos || datos.formato !== 'conciliador-memoria' || !Array.isArray(datos.reglas)) return { error: 'El archivo no es una memoria del conciliador.' };
+    const db = cargar(); const esp = espacio(db, clave, empresa || datos.empresa);
+    let nuevas = 0, repetidas = 0;
+    for (const r of datos.reglas) {
+      if (!r || !r.patron) continue;
+      const ya = esp.reglas.find((x) => x.patron === r.patron && (x.signo || 0) === (r.signo || 0));
+      if (ya) { repetidas++; continue; }
+      esp.reglas.push(Object.assign({}, r, { id: 'R' + Date.now().toString(36) + Math.floor(Math.random() * 1000), importada: true }));
+      nuevas++;
+    }
+    for (const [k, v] of Object.entries(datos.cuentas || {})) if (!esp.cuentas[k]) esp.cuentas[k] = v;
+    guardar(db);
+    return { nuevas, repetidas, empresaImportada: datos.empresa || '' };
+  }
+
+  root.Memoria = { cargar, guardar, claveEmpresa, patronDe, calza, reglaPara, agregarRegla, borrarRegla, listar, aplicar, recordarCuenta, cuentaRecordada, exportar, importar };
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
+<script>
 (function () {
   'use strict';
   const C = window.Concilia;
@@ -2073,6 +2213,13 @@ window.DEMO_DATA={"empresa":"Distribuidora Quillay SpA (ejemplo ficticio)","banc
     const keys = [...fue.f.movimientosPorCuenta.keys()];
     if (st.sel.cuenta && keys.includes(st.sel.cuenta)) return;
     st.sel.cuenta = null; st.sel.sugerida = null;
+    const rutA = (fue.arch.analisis.meta && fue.arch.analisis.meta.rut) || (cart && cart.ca.rut) || '';
+    const empA = st.empresa || (fue.arch.analisis.meta && fue.arch.analisis.meta.empresa) || (cart && cart.ca.titular) || '';
+    const claveA = window.Memoria.claveEmpresa(rutA, empA);
+    if (cart && cart.ca.numeroCuenta) {
+      const rec = window.Memoria.cuentaRecordada(claveA, cart.ca.numeroCuenta);
+      if (rec && keys.includes(rec)) { st.sel.cuenta = rec; st.sel.sugerida = 'memoria'; return; }
+    }
     if (cart) {
       const sug = window.Lector.sugerirCuenta(cart.ca, fue.arch.analisis);
       if (sug && sug.mejor) {
@@ -2242,7 +2389,16 @@ window.DEMO_DATA={"empresa":"Distribuidora Quillay SpA (ejemplo ficticio)","banc
       cuenta: cuentaInfo, plan, archivoLibro: fs.arch.fileName, archivoCartola: cs.arch.fileName, hojaLibro: fs.f.hojaNombre, hojaCartola: ca.hojaNombre,
       integridadCartola: ca.integridad,
     };
+    // memoria de la empresa (reglas aprendidas y cuenta recordada)
+    const rutEmp = (anLibro.meta && anLibro.meta.rut) || ca.rut || '';
+    const nomEmp = S.empresa || (anLibro.meta && anLibro.meta.empresa) || ca.titular || '';
+    const claveMem = window.Memoria.claveEmpresa(rutEmp, nomEmp);
+    R.meta.mem = { clave: claveMem, empresa: nomEmp, rut: rutEmp };
+    R.meta.cuentasPlan = (anLibro.cuentas || []).slice().sort((a, b) => String(a.codigo).localeCompare(String(b.codigo)));
     R.byId = new Map([...R.banco, ...R.libro].map((m) => [m.id, m]));
+    const firma = [claveMem, periodo.start, periodo.end, ca.id, S.sel.cuenta, R.diffs.length].join('|');
+    R.meta.memRes = window.Memoria.aplicar(claveMem, R.diffs, C.nombreCuenta(plan.banco), firma, R.byId);
+    if (ca.numeroCuenta) window.Memoria.recordarCuenta(claveMem, nomEmp, ca.numeroCuenta, S.sel.cuenta);
     R.resB = C.resumenPeriodo(R.banco, iniB || 0);
     R.resL = C.resumenPeriodo(R.libro, iniL || 0);
     R.bankName = (ca.banco && ca.banco.nombre) || nombreBancoDeCuenta(cuentaInfo.nombre) || null;
@@ -2357,7 +2513,7 @@ window.DEMO_DATA={"empresa":"Distribuidora Quillay SpA (ejemplo ficticio)","banc
     const verTodas = UI.verTodasCuentas;
     const lista = verTodas ? cuentas : cuentas.filter((c) => window.Lector.esBanco({ nombre: c.nombre || c.key, rubro: '', clase: '' })).slice(0, 8);
     const auto = sel ? periodoAuto(sel.ca.movimientos) : null;
-    const nota = { numero: 'coincide con el número de cuenta de la cartola', probable: 'la más parecida a la cartola', unica: 'la única cuenta de banco del libro' }[S.sel.sugerida];
+    const nota = { numero: 'coincide con el número de cuenta de la cartola', probable: 'la más parecida a la cartola', unica: 'la única cuenta de banco del libro', memoria: 'la que elegiste la vez pasada' }[S.sel.sugerida];
     return `<article class="panel"><div class="panel-h"><div><h2>Qué vamos a conciliar</h2><p>Elegí lo más probable; cámbialo si no es lo que querías.</p></div>
       <button class="btn primary" data-go="conciliacion" ${R ? '' : 'disabled'}>${ICON.scale} Conciliar</button></div>
       <div class="panel-b" style="display:flex;flex-direction:column;gap:16px">
@@ -2508,6 +2664,13 @@ window.DEMO_DATA={"empresa":"Distribuidora Quillay SpA (ejemplo ficticio)","banc
       .concat(GRUPOS.map((g) => { const n = R.diffs.filter((d) => d.grupo === g.id).length; return n ? `<button class="fchip" data-dfilter="${g.id}" aria-pressed="${f === g.id}"><span class="dot" style="background:${g.color}"></span>${g.titulo} <span class="muted">${n}</span></button>` : ''; }));
     if (f.startsWith('tipo:')) chips.push(`<button class="fchip" data-dfilter="${f}" aria-pressed="true">${esc((C.TIPOS[f.slice(5)] || { titulo: 'Filtro' }).titulo)} ✕</button>`);
     const done = R.diffs.filter((d) => S.revisados[d.id]).length;
+    const mem = window.Memoria.listar(R.meta.mem.clave);
+    const nAplicadas = R.diffs.filter((d) => d.regla).length;
+    const nConflicto = R.diffs.filter((d) => d.reglaConflicto).length;
+    const panelMem = `<article class="panel"><div class="panel-h"><div><h2>Memoria de imputaciones</h2>
+      <p>${mem.reglas.length ? `${mem.reglas.length} regla(s) aprendida(s)${R.meta.mem.empresa ? ' para ' + esc(R.meta.mem.empresa) : ''}${nAplicadas ? ` · ${nAplicadas} diferencia(s) imputada(s) por regla en este período` : ''}${nConflicto ? ` · ${nConflicto} con dos tratamientos distintos` : ''}`
+        : 'Todavía no hay reglas. Cuando corrijas la cuenta de una diferencia, guárdala como regla y el próximo mes se imputa sola.'}</p></div>
+      <div class="btn-row"><button class="btn sm" data-act="reglas">Ver reglas</button></div></div></article>`;
     const toolbar = `<div class="btn-row" style="justify-content:space-between"><div class="chips">${chips.join('')}</div>
       <label class="check"><input type="checkbox" data-act="hidedone" ${UI.hideDone ? 'checked' : ''}> Ocultar revisadas (${done})</label></div>`;
     let ia = '';
@@ -2535,7 +2698,7 @@ window.DEMO_DATA={"empresa":"Distribuidora Quillay SpA (ejemplo ficticio)","banc
         ${items.map(diffItem).join('')}</section>`;
     }).join('');
     const empty = !R.diffs.length ? `<div class="panel empty"><strong>No hay diferencias</strong><p>Todos los movimientos de la cartola y del libro quedaron conciliados.</p></div>` : (!groups ? '<div class="panel empty"><strong>Nada que mostrar con este filtro</strong></div>' : '');
-    return head + toolbar + ia + groups + empty;
+    return head + toolbar + panelMem + ia + groups + empty;
   }
   function diffItem(d) {
     const open = UI.open.has(d.id); const done = !!S.revisados[d.id];
@@ -2559,6 +2722,7 @@ window.DEMO_DATA={"empresa":"Distribuidora Quillay SpA (ejemplo ficticio)","banc
           <h4><label for="nota-${esc(d.id)}">Nota o respaldo</label></h4><textarea id="nota-${esc(d.id)}" data-nota="${esc(d.id)}" rows="2" placeholder="Ej.: factura del banco N° 12345, confirmado con tesorería">${esc(S.notas[d.id] || '')}</textarea>
         </div>
         <div><h4>Asiento de ajuste sugerido</h4>${asiento}
+          ${reglaBox(d)}
           <div class="btn-row" style="margin-top:14px">
             <button class="btn sm ${done ? '' : 'primary'}" data-act="done" data-d="${esc(d.id)}">${done ? 'Marcar pendiente' : ICON.check + ' Marcar revisada'}</button>
             ${d.banco.length && d.libro.length ? `<button class="btn sm" data-act="reject" data-d="${esc(d.id)}" title="Separar: no son el mismo movimiento">No corresponden</button>` : `<button class="btn sm" data-act="link" data-d="${esc(d.id)}">${ICON.link} Enlazar manualmente</button>`}
@@ -2566,6 +2730,47 @@ window.DEMO_DATA={"empresa":"Distribuidora Quillay SpA (ejemplo ficticio)","banc
           </div>
           ${ai ? `<div class="ai-box"><div class="ai-h">${ICON.spark.replace('<svg', '<svg width="14" height="14"')} Asistente</div><div class="md">${ai.text ? md(ai.text) : `<span class="thinking">Analizando…</span>`}</div>${ai.error ? `<p class="small neg">${esc(ai.error)}</p>` : ''}</div>` : ''}
         </div></div></details>`;
+  }
+
+  function reglaBox(d) {
+    if (d.tipo !== 'cargo_banco' && d.tipo !== 'abono_banco') return '';
+    const cuentas = R.meta.cuentasPlan || [];
+    const patron = window.Memoria.patronDe(d.desc);
+    const actual = d.cuentaSugerida || '';
+    const opciones = ['<option value="">— elegir cuenta del plan —</option>']
+      .concat(cuentas.map((c) => `<option value="${esc((c.codigo || '') + '|' + (c.nombre || ''))}" ${actual === C.nombreCuenta(c) ? 'selected' : ''}>${esc(C.nombreCuenta(c))}</option>`)).join('');
+    const badge = d.regla ? `<div class="btn-row" style="margin-top:8px"><span class="pill ok">${ICON.check} Imputada por regla: «${esc(d.regla.patron)}»${d.regla.usos ? ' · usada ' + d.regla.usos + ' vez(ces)' : ''}</span>
+      <button class="btn sm ghost" data-act="borrarregla" data-r="${esc(d.regla.id)}">Quitar regla</button></div>` : '';
+    const conflicto = d.reglaConflicto ? `<div class="callout warn" style="margin-top:8px">${ICON.alert}<div>Esta glosa la has imputado a más de una cuenta (${d.reglaConflicto.map((x) => esc(x.cuenta)).join(' · ')}), así que no elegí ninguna. Indica cuál corresponde esta vez.</div></div>` : '';
+    return badge + conflicto + `<details class="mapping regla" data-d="${esc(d.id)}"><summary>${d.regla ? 'Cambiar la imputación y la regla' : 'Recordar esta imputación para el futuro'}</summary>
+      <div class="map-grid" style="grid-template-columns:1fr">
+        <div class="field"><label for="rg-c-${esc(d.id)}">Cuenta del plan</label><select id="rg-c-${esc(d.id)}" data-rg="cuenta" data-d="${esc(d.id)}">${opciones}</select></div>
+        <div class="field"><label for="rg-p-${esc(d.id)}">Se aplicará a los movimientos cuya glosa contenga</label>
+          <input type="text" id="rg-p-${esc(d.id)}" data-rg="patron" data-d="${esc(d.id)}" value="${esc(patron)}">
+          <small>Sin números de operación. Ejemplo de esta glosa: «${esc(d.desc.slice(0, 60))}»</small></div>
+        <div class="btn-row"><button class="btn sm primary" data-act="guardarregla" data-d="${esc(d.id)}">${ICON.check} Guardar regla</button>
+          <span class="small muted">Solo para ${d.monto < 0 ? 'cargos' : 'abonos'}, en esta empresa.</span></div>
+      </div></details>`;
+  }
+  function abrirReglas() {
+    const mem = window.Memoria.listar(R.meta.mem.clave);
+    const filas = mem.reglas.slice().sort((a, b) => (b.usos || 0) - (a.usos || 0)).map((r) => `<tr>
+      <td><b>${esc(r.patron)}</b>${r.signo ? `<small class="muted"> · solo ${r.signo < 0 ? 'cargos' : 'abonos'}</small>` : ''}</td>
+      <td>${esc(C.nombreCuenta({ codigo: r.cuentaCodigo, nombre: r.cuentaNombre }))}</td>
+      <td class="num">${r.usos || 0}</td>
+      <td class="small muted">${r.ultimoUso ? ff(r.ultimoUso.slice(0, 10)) : '—'}</td>
+      <td><button class="btn sm ghost" data-act="borrarregla" data-r="${esc(r.id)}">Borrar</button></td></tr>`).join('');
+    $('#dlg').innerHTML = `<form method="dialog" style="display:contents">
+      <div class="dlg-h"><h2>Reglas aprendidas${R.meta.mem.empresa ? ' · ' + esc(R.meta.mem.empresa) : ''}</h2><button class="btn sm ghost" value="cancel" aria-label="Cerrar">${ICON.x}</button></div>
+      <div class="dlg-b">
+        ${mem.reglas.length ? `<div class="tbl-wrap"><table><thead><tr><th>Cuando la glosa contiene</th><th>Imputar a</th><th class="num">Usos</th><th>Última vez</th><th></th></tr></thead><tbody>${filas}</tbody></table></div>`
+        : '<p class="muted">Todavía no hay reglas para esta empresa.</p>'}
+        <p class="small muted">Las reglas se guardan en este equipo, separadas por empresa. Expórtalas para llevarlas a otro computador o dejarlas en la carpeta del cliente.</p>
+      </div>
+      <div class="dlg-f"><span class="btn-row"><button class="btn sm" type="button" data-act="exportarreglas">Exportar reglas</button>
+        <label class="btn sm" style="cursor:pointer">Importar reglas<input type="file" accept=".json,application/json" data-file="reglas" style="position:absolute;width:1px;height:1px;opacity:0"></label></span>
+      <button class="btn" value="cancel">Cerrar</button></div></form>`;
+    $('#dlg').showModal();
   }
 
   /* ================= enlazar manual ================= */
@@ -2866,10 +3071,14 @@ ${sinL.map(ln).join('\n') || '(ninguno)'}`;
     ws.addRow([]); ws.addRow(['Preparado por: ______________________', '', 'Revisado por: ______________']);
     // Diferencias
     ws = wb.addWorksheet('Diferencias');
-    ws.columns = [{ width: 26 }, { width: 22 }, { width: 12 }, { width: 44 }, { width: 16 }, { width: 16 }, { width: 16 }, { width: 60 }, { width: 11 }, { width: 36 }];
-    header(ws, ['Tipo', 'Tratamiento', 'Fecha', 'Descripción', 'Monto', 'Ajuste banco', 'Ajuste libro', 'Explicación', 'Revisada', 'Nota']);
+    ws.columns = [{ width: 26 }, { width: 22 }, { width: 12 }, { width: 44 }, { width: 16 }, { width: 16 }, { width: 16 }, { width: 34 }, { width: 34 }, { width: 60 }, { width: 11 }, { width: 36 }];
+    header(ws, ['Tipo', 'Tratamiento', 'Fecha', 'Descripción', 'Monto', 'Ajuste banco', 'Ajuste libro', 'Cuenta sugerida', 'Origen de la imputación', 'Explicación', 'Revisada', 'Nota']);
     const gname = { error: 'Error de registro', ajuste: 'Asiento de ajuste', transito: 'Partida en tránsito', revisar: 'Por revisar' };
-    R.diffs.forEach((d) => { const r = ws.addRow([d.titulo + (d.subtipo ? ' – ' + d.subtipo : ''), gname[d.grupo], dateX(d.fecha), d.desc, d.monto, d.ajusteBanco || null, d.ajusteLibro || null, d.explicacion, S.revisados[d.id] ? 'Sí' : 'No', S.notas[d.id] || '']); r.getCell(3).numFmt = 'dd-mm-yyyy'; [5, 6, 7].forEach((i) => (r.getCell(i).numFmt = money)); r.alignment = { vertical: 'top', wrapText: true }; });
+    R.diffs.forEach((d) => {
+      const origen = d.regla ? 'Regla aprendida: «' + d.regla.patron + '»' : (d.cuentaSugerida ? 'Motor de conciliación' : '');
+      const r = ws.addRow([d.titulo + (d.subtipo ? ' – ' + d.subtipo : ''), gname[d.grupo], dateX(d.fecha), d.desc, d.monto, d.ajusteBanco || null, d.ajusteLibro || null, d.cuentaSugerida || '', origen, d.explicacion, S.revisados[d.id] ? 'Sí' : 'No', S.notas[d.id] || '']);
+      r.getCell(3).numFmt = 'dd-mm-yyyy'; [5, 6, 7].forEach((i) => (r.getCell(i).numFmt = money)); r.alignment = { vertical: 'top', wrapText: true };
+    });
     // Asientos
     ws = wb.addWorksheet('Asientos de ajuste');
     ws.columns = [{ width: 6 }, { width: 12 }, { width: 44 }, { width: 16 }, { width: 16 }, { width: 60 }];
@@ -3007,6 +3216,30 @@ ${sinL.map(ln).join('\n') || '(ninguno)'}`;
       case 'xlsx': exportXLSX().catch((e) => { console.error(e); toast('No se pudo generar el Excel.'); }); break;
       case 'pdf': exportPDF().catch((e) => { console.error(e); toast('No se pudo generar el PDF.'); }); break;
       case 'hidedone': UI.hideDone = t.checked; render(); break;
+      case 'reglas': abrirReglas(); break;
+      case 'guardarregla': {
+        const d = R.diffs.find((x) => x.id === dId); if (!d) return;
+        const selC = document.querySelector(`[data-rg="cuenta"][data-d="${CSS.escape(dId)}"]`);
+        const inpP = document.querySelector(`[data-rg="patron"][data-d="${CSS.escape(dId)}"]`);
+        const patron = (inpP && inpP.value || '').trim().toLowerCase();
+        if (!selC || !selC.value) { toast('Elige primero la cuenta del plan.'); return; }
+        if (patron.length < 3) { toast('El texto a reconocer es muy corto.'); return; }
+        const [codigo, nombre] = selC.value.split('|');
+        window.Memoria.agregarRegla(R.meta.mem.clave, R.meta.mem.empresa, { patron, cuentaCodigo: codigo, cuentaNombre: nombre, tipo: d.tipo, signo: d.monto < 0 ? -1 : 1 });
+        UI.open.add(dId); changed(); toast('Regla guardada: se aplicará sola la próxima vez.');
+        break;
+      }
+      case 'borrarregla': {
+        window.Memoria.borrarRegla(R.meta.mem.clave, t.dataset.r);
+        const dlg = $('#dlg'); if (dlg.open) { changed(); abrirReglas(); } else changed();
+        toast('Regla eliminada.');
+        break;
+      }
+      case 'exportarreglas': {
+        const nombre = 'reglas-' + (C.norm(R.meta.mem.empresa || 'empresa').replace(/[^a-z0-9]+/g, '-') || 'empresa') + '.json';
+        saveFile(nombre, new Blob([window.Memoria.exportar(R.meta.mem.clave)], { type: 'application/json' }));
+        break;
+      }
     }
   });
   function confirmInline(btn) {
@@ -3021,6 +3254,16 @@ ${sinL.map(ln).join('\n') || '(ninguno)'}`;
   }, true);
   document.addEventListener('change', (ev) => {
     const t = ev.target;
+    if (t.dataset.file === 'reglas') {
+      const f = t.files && t.files[0]; t.value = '';
+      if (f) f.text().then((txt) => {
+        const res = window.Memoria.importar(R.meta.mem.clave, R.meta.mem.empresa, txt);
+        if (res.error) { toast(res.error); return; }
+        toast(`${res.nuevas} regla(s) importada(s)${res.repetidas ? ', ' + res.repetidas + ' ya existían' : ''}.`);
+        changed(); if ($('#dlg').open) abrirReglas();
+      });
+      return;
+    }
     if (t.dataset.file) { if (t.files && t.files.length) readFiles(t.files); t.value = ''; return; }
     if (t.dataset.sel) {
       const k = t.dataset.sel;
